@@ -24,8 +24,12 @@ RUN apt-get update && apt-get install -y wget libssl-dev && rm -rf /var/lib/apt/
 # Copy the binary from the builder stage
 COPY --from=builder /product-service/target/release/product-service /app
 
+# Copy the entrypoint script
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 # Set the environment variable for the app version number
 ENV APP_VERSION=$APP_VERSION
 
-# Run the application
-CMD ["./product-service"]
+# Run the application with the entrypoint script
+CMD ["/app/entrypoint.sh"]

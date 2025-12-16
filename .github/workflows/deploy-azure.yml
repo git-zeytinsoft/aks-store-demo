@@ -1,0 +1,157 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'infra/**'
+      - 'charts/**'
+      - '.github/workflows/deploy-azure.yml'
+  workflow_dispatch:
+
+env:
+  IMAGE_VERSION: ${{ github.sha }}
+  REGISTRY_GHCR: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: production
+    outputs:
+      resource-group: ${{ steps.deploy.outputs.resource-group }}
+      aks-cluster: ${{ steps.deploy.outputs.aks-cluster }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Deploy Bicep templates
+        id: deploy
+        run: |
+          # Set default values or use environment variables
+          RESOURCE_GROUP="${{ secrets.RESOURCE_GROUP_NAME }}"
+          LOCATION="${{ secrets.AZURE_LOCATION || 'eastus' }}"
+          AKS_NAME="${{ secrets.AKS_CLUSTER_NAME }}"
+          
+          echo "Deploying infrastructure to resource group: $RESOURCE_GROUP"
+          
+          # Create resource group if it doesn't exist
+          az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+          
+          # Deploy Bicep template (adjust path as needed)
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/bicep/main.bicep \
+            --parameters infra/bicep/main.parameters.json \
+            --parameters location="$LOCATION"
+          
+          # Output resource names
+          echo "resource-group=$RESOURCE_GROUP" >> $GITHUB_OUTPUT
+          echo "aks-cluster=$AKS_NAME" >> $GITHUB_OUTPUT
+        continue-on-error: false
+
+  deploy-application:
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    permissions:
+      contents: read
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Get AKS credentials
+        run: |
+          RESOURCE_GROUP="${{ secrets.RESOURCE_GROUP_NAME }}"
+          AKS_NAME="${{ secrets.AKS_CLUSTER_NAME }}"
+          
+          az aks get-credentials \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AKS_NAME" \
+            --overwrite-existing
+      
+      - name: Create namespace
+        run: |
+          kubectl create namespace pets --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Update Kubernetes manifest with image versions
+        run: |
+          # Update image tags in kustomize overlays with current version
+          find kustomize/overlays/azd -name "*.yaml" -type f -exec sed -i \
+            "s|image: ${{ env.REGISTRY_GHCR }}/\([^:]*\):latest|image: ${{ env.REGISTRY_GHCR }}/\1:${{ env.IMAGE_VERSION }}|g" {} \;
+      
+      - name: Deploy with Kustomize
+        run: |
+          kubectl apply -k kustomize/overlays/azd -n pets
+      
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment -n pets --all --timeout=5m
+        continue-on-error: true
+      
+      - name: Check deployment status
+        run: |
+          echo "Deployment Summary:"
+          kubectl get deployments -n pets
+          kubectl get services -n pets
+          kubectl get pods -n pets
+
+  run-e2e-tests:
+    runs-on: ubuntu-latest
+    needs: deploy-application
+    permissions:
+      contents: read
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'tests/package-lock.json'
+      
+      - name: Install test dependencies
+        working-directory: tests
+        run: npm ci
+      
+      - name: Install Playwright browsers
+        working-directory: tests
+        run: npx playwright install
+      
+      - name: Get AKS public IP
+        id: get-ip
+        run: |
+          RESOURCE_GROUP="${{ secrets.RESOURCE_GROUP_NAME }}"
+          # Get the ingress IP or load balancer IP
+          IP=$(kubectl get ingress -n pets -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+          if [ -z "$IP" ]; then
+            IP=$(kubectl get svc -n pets -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+          fi
+          echo "app-url=http://$IP" >> $GITHUB_OUTPUT
+          echo "Application URL: http://$IP"
+        continue-on-error: true
+      
+      - name: Run E2E tests
+        working-directory: tests
+        run: npx playwright test --reporter=github
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_TEST_BASE_URL: ${{ steps.get-ip.outputs.app-url }}
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: playwright-report
+          path: tests/playwright-report/
